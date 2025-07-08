@@ -6,7 +6,7 @@
 
 # Overview
 
-This repository implements and extends the Weight Predictor Network with Feature Selection (WPFS) for high-dimensional, low-sample-size (HDLSS) biomedical datasets. It introduces C-WPFS, a novel architecture that integrates a two-stage contrastive representation learning approach. The model first utilizes unsupervised contrastive learning via SimCLR's NT-Xent loss to capture data structure, then applies supervised contrastive learning (SupCon) to enhance class-specific clustering.
+This repository implements and extends the Weight Predictor Network with Feature Selection (WPFS) for high-dimensional, low-sample-size (HDLSS) biomedical datasets. It introduces DualCLR, a novel architecture that integrates a two-stage contrastive representation learning approach. The model first utilizes unsupervised contrastive learning via SimCLR's NT-Xent loss to capture data structure, then applies supervised contrastive learning (SupCon) to enhance class-specific clustering.
 
 # Installation
 
