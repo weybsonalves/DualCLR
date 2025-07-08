@@ -1,0 +1,8 @@
+*.zip
+*.ipynb_checkpoints
+*.png
+*.gif
+*.txt
+logs
+lightning_logs
+__pycache__

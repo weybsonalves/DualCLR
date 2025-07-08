@@ -38,6 +38,48 @@ def train(args):
 
 
 	#### Baselines training
+	if args.use_crm:
+		crm = CRM(input_dim=args.num_features, hidden_dim=args.crm_hidden_dim, latent_dim=args.crm_latent_dim, proj_dim=args.crm_projector_dim)
+		feature_std = torch.from_numpy(np.std(data_module.X_train, axis=0)).float()
+		pretrain_dataset = PretrainDataset(
+			data_module.X_train, data_module.y_train, feature_std,
+			p_mask=args.aug_p_mask, sigma_noise=args.aug_sigma_noise,
+			p_synthetic=args.aug_p_synthetic, beta=args.aug_beta
+		)
+		pretrain_dataloader = DataLoader(
+			pretrain_dataset, batch_size=args.batch_size, shuffle=True,
+			num_workers=args.num_workers, pin_memory=args.pin_memory
+		)
+		pretrain_model = PretrainModel(args, crm)
+		pretrain_trainer = pl.Trainer(
+			max_epochs=args.pretrain_epochs,
+			accelerator="auto",
+			devices="auto",
+			logger=csv_logger,
+			callbacks=[RichProgressBar()]
+		)
+		pretrain_trainer.fit(pretrain_model, pretrain_dataloader)
+		
+		
+		if args.use_supcon:
+			supcon_model = SupConFineTuner(args, crm)
+			trainer = pl.Trainer(max_epochs=args.supcon_epochs, gpus=1)
+			trainer.fit(supcon_model, pretrain_dataloader)
+		
+		# Freeze CRM
+		crm.requires_grad_(False)
+
+		# Compute latent representations
+		with torch.no_grad():
+			h_train, _ = crm(torch.tensor(data_module.X_train))
+			h_valid, _ = crm(torch.tensor(data_module.X_valid))
+			h_test, _ = crm(torch.tensor(data_module.X_test))
+
+			h_train = h_train.cpu().numpy()
+			h_valid = h_valid.cpu().numpy()
+			h_test = h_test.cpu().numpy()
+		data_module.set_latent_representations(h_train, h_valid, h_test)
+	
 	if args.model == 'rf':
 		# scikit-learn expects class_weights to be a dictionary
 		class_weights = {}
@@ -57,9 +99,13 @@ def train(args):
 		y_pred_valid = model.predict(data_module.X_valid)
 		y_pred_test = model.predict(data_module.X_test)
 
-		train_metrics = compute_all_metrics(args, data_module.y_train, y_pred_train)
-		valid_metrics = compute_all_metrics(args, data_module.y_valid, y_pred_valid)
-		test_metrics = compute_all_metrics(args, data_module.y_test, y_pred_test)
+		y_hat_train = model.predict_proba(data_module.X_train)
+		y_hat_valid = model.predict_proba(data_module.X_valid)
+		y_hat_test = model.predict_proba(data_module.X_test)
+
+		train_metrics = compute_all_metrics(args, data_module.y_train, y_pred_train, y_hat_train)
+		valid_metrics = compute_all_metrics(args, data_module.y_valid, y_pred_valid, y_hat_valid)
+		test_metrics = compute_all_metrics(args, data_module.y_test, y_pred_test, y_hat_test)
 
 		res = {}
 		for metrics, dataset_name in zip(
@@ -212,7 +258,7 @@ def parse_arguments(args=None):
 
 	parser.add_argument('--max_steps', type=int, default=10000, help='Specify the max number of steps to train.')
 	parser.add_argument('--lr', type=float, default=3e-3, help='Learning rate')
-	parser.add_argument('--batch_size', type=int, default=8)
+	parser.add_argument('--batch_size', type=int, default=10)
 
 	parser.add_argument('--gamma', type=float, default=0, 
 						help='The factor multiplied to the reconstruction error (DietNetworks and FsNet) \
@@ -283,10 +329,27 @@ def parse_arguments(args=None):
 	parser.set_defaults(pin_memory=True)
 
 
-	
 	####### Logging
 	parser.add_argument('--experiment_name', type=str, default='', help='Name for the experiment')
 
+
+	# CRM and pretraining arguments
+	parser.add_argument('--use_crm', action='store_true', default=False, help='Use CRM for dimensionality reduction with WPFS')
+	parser.add_argument('--crm_hidden_dim', type=int, default=128, help='Hidden dimension for CRM')
+	parser.add_argument('--crm_latent_dim', type=int, default=64, help='Latent dimension for CRM')
+	parser.add_argument('--crm_projector_dim', type=int, default=32, help='Projector dimension for CRM')
+	parser.add_argument('--contrastive_temperature', type=float, default=0.1, help='Temperature for NT-Xent loss')
+	parser.add_argument('--pretrain_lr', type=float, default=1e-3, help='Learning rate for pretraining CRM')
+	parser.add_argument('--pretrain_epochs', type=int, default=100, help='Number of epochs for pretraining CRM')
+	parser.add_argument('--aug_p_mask', type=float, default=0.05, help='Probability of masking features')
+	parser.add_argument('--aug_sigma_noise', type=float, default=0.1, help='Noise scale for injection')
+	parser.add_argument('--aug_p_synthetic', type=float, default=0.3, help='Probability of synthetic oversampling')
+	parser.add_argument('--aug_beta', type=float, default=0.1, help='Interpolation factor for synthetic oversampling')
+	
+	parser.add_argument('--use_supcon', action='store_true', default=False, help='Use SupCon')
+	parser.add_argument("--supcon_temperature", type=float, default=0.1)
+	parser.add_argument("--supcon_lr", type=float, default=1e-3)
+	parser.add_argument("--supcon_epochs", type=int, default=10)
 
 	return parser.parse_args(args)
 

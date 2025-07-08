@@ -4,7 +4,8 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 
 import numpy as np
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, roc_auc_score, matthews_corrcoef
+from scipy.special import softmax
 
 from sparsity_network import SparsityNetwork
 from weight_predictor_network import WeightPredictorNetwork
@@ -12,19 +13,75 @@ from weight_predictor_network import WeightPredictorNetwork
 
 
 def get_labels_lists(outputs):
-	all_y_true, all_y_pred = [], []
+	all_y_true, all_y_pred, all_y_hat = [], [], []
 	for output in outputs:
 		all_y_true.extend(output['y_true'].detach().cpu().numpy().tolist())
 		all_y_pred.extend(output['y_pred'].detach().cpu().numpy().tolist())
+		all_y_hat.extend(output['y_hat'].tolist())
 
-	return all_y_true, all_y_pred
+	return all_y_true, all_y_pred, all_y_hat
 
 
-def compute_all_metrics(args, y_true, y_pred):
-	metrics = {}
-	metrics['balanced_accuracy'] = balanced_accuracy_score(y_true, y_pred)
-	
-	return metrics
+def expected_calibration_error(y_true, y_prob, num_bins=10):
+    """
+    Calcula o Expected Calibration Error (ECE) para avaliar a calibração das probabilidades previstas.
+    
+    Args:
+        y_true: Array de rótulos verdadeiros (N,)
+        y_prob: Array de probabilidades previstas (N, C), onde C é o número de classes
+        num_bins: Número de intervalos para discretizar as probabilidades (padrão: 10)
+    
+    Returns:
+        float: Valor do ECE
+    """
+    confidences, predictions = np.max(y_prob, axis=1), np.argmax(y_prob, axis=1)
+    accuracies = predictions == y_true
+    bin_boundaries = np.linspace(0, 1, num_bins + 1)
+    ece = 0.0
+    for bin_lower, bin_upper in zip(bin_boundaries[:-1], bin_boundaries[1:]):
+        in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+        if in_bin.any():
+            accuracy_in_bin = accuracies[in_bin].mean()
+            confidence_in_bin = confidences[in_bin].mean()
+            prop_in_bin = in_bin.mean()
+            ece += np.abs(accuracy_in_bin - confidence_in_bin) * prop_in_bin
+    return ece
+
+def compute_all_metrics(args, y_true, y_pred, y_hat=None):
+    """
+    Calcula métricas de avaliação: balanced accuracy, AUCROC macro, MCC e ECE.
+    
+    Args:
+        args: Objeto com argumentos, possivelmente contendo num_classes
+        y_true: Array de rótulos verdadeiros (N,)
+        y_pred: Array de rótulos previstos (N,)
+        y_hat: Array de logits ou probabilidades previstas (N, C), opcional
+    
+    Returns:
+        dict: Dicionário com os valores das métricas
+    """
+    metrics = {}
+    
+    # Acurácia Balanceada
+    metrics['balanced_accuracy'] = balanced_accuracy_score(y_true, y_pred)
+    
+    # Matthews Correlation Coefficient (MCC)
+    metrics['mcc'] = matthews_corrcoef(y_true, y_pred)
+    
+    # AUCROC Macro e ECE (requerem probabilidades)
+    if y_hat is not None:
+        # Converte logits em probabilidades usando softmax
+        y_prob = softmax(y_hat, axis=1)
+        
+        # AUCROC Macro
+        if len(np.unique(y_true)) == y_prob.shape[1]:
+            metrics['aucroc_macro'] = roc_auc_score(y_true, y_prob if y_prob.shape[1] > 2 else y_prob[:, 1], multi_class='ovr', average='macro')
+        else:
+            metrics['aucroc_macro'] = np.nan
+        # Expected Calibration Error (ECE)
+        metrics['ece'] = expected_calibration_error(y_true, y_prob)
+    
+    return metrics
 
 
 def detach_tensors(tensors):
@@ -343,9 +400,11 @@ class GeneralNeuralNetwork(pl.LightningModule):
 		self.log(f"{key}/sparsity_loss{dataloader_name}", losses['sparsity'].item())
 
 	def log_epoch_metrics(self, outputs, key, dataloader_name=""):
-		y_true, y_pred = get_labels_lists(outputs)
-		self.log(f'{key}/balanced_accuracy{dataloader_name}', balanced_accuracy_score(y_true, y_pred))
+		y_true, y_pred, y_hat = get_labels_lists(outputs)
+		metrics = compute_all_metrics(self.args, y_true, y_pred, y_hat)
 
+		for metric_name, metric_value in metrics.items():
+			self.log(f'{key}/{metric_name}{dataloader_name}', metric_value)
 
 
 	def training_step(self, batch, batch_idx):
@@ -361,7 +420,8 @@ class GeneralNeuralNetwork(pl.LightningModule):
 			'loss': losses['total'],
 			'losses': detach_tensors(losses),
 			'y_true': y_true,
-			'y_pred': torch.argmax(y_hat, dim=1)
+			'y_pred': torch.argmax(y_hat, dim=1),
+			'y_hat': y_hat.detach().cpu().numpy(),
 		}
 
 	def training_epoch_end(self, outputs):
@@ -379,7 +439,8 @@ class GeneralNeuralNetwork(pl.LightningModule):
 		return {
 			'losses': detach_tensors(losses),
 			'y_true': y_true,
-			'y_pred': torch.argmax(y_hat, dim=1)
+			'y_pred': torch.argmax(y_hat, dim=1),
+			'y_hat': y_hat.detach().cpu().numpy(),
 		}
 
 	def validation_epoch_end(self, outputs):
@@ -454,3 +515,159 @@ class GeneralNeuralNetwork(pl.LightningModule):
 					'name': 'lr_scheduler'
 				}
 			}
+
+class NT_Xent(nn.Module):
+    def __init__(self, temperature, world_size=1):
+        super(NT_Xent, self).__init__()
+        self.temperature = temperature
+        self.world_size = world_size
+        self.criterion = nn.CrossEntropyLoss(reduction="sum")
+        self.similarity_f = nn.CosineSimilarity(dim=2)
+
+    @staticmethod
+    def _mask_correlated_samples(batch_size, world_size):
+        """
+        Cria a máscara para eliminar da matriz de similaridade:
+        - similaridades de cada exemplo consigo mesmo
+        - similaridade entre os pares positivos
+        """
+        N = 2 * batch_size * world_size
+        mask = torch.ones((N, N), dtype=torch.bool)
+        mask.fill_diagonal_(0)
+        for i in range(batch_size * world_size):
+            mask[i, batch_size * world_size + i] = 0
+            mask[batch_size * world_size + i, i] = 0
+        return mask
+
+    def forward(self, z_i, z_j):
+        # batch_size real (pode ser < batch_size configurado)
+        batch_size = z_i.size(0)
+        N = 2 * batch_size * self.world_size
+
+        # concatena as duas visões aumentadas
+        z = torch.cat([z_i, z_j], dim=0)  # shape: (2*batch_size, dim)
+
+        # calcula similaridades
+        sim = self.similarity_f(z.unsqueeze(1), z.unsqueeze(0)) / self.temperature
+        # extrai os positivos
+        sim_i_j = torch.diag(sim, batch_size * self.world_size)
+        sim_j_i = torch.diag(sim, -batch_size * self.world_size)
+        positive_samples = torch.cat([sim_i_j, sim_j_i], dim=0).view(N, 1)
+
+        # máscara e negativos
+        mask = self._mask_correlated_samples(batch_size, self.world_size).to(sim.device)
+        negative_samples = sim[mask].view(N, -1)
+
+        # constrói logits e labels
+        logits = torch.cat([positive_samples, negative_samples], dim=1)
+        labels = torch.zeros(N, dtype=torch.long, device=logits.device)
+
+        loss = self.criterion(logits, labels)
+        loss = loss / N
+        return loss
+		
+class CRM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim, proj_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+			nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, latent_dim)
+        )
+
+        self.projector = nn.Linear(latent_dim, proj_dim)
+
+    def forward(self, x):
+        h = self.encoder(x)
+        z = self.projector(h)
+        return h, z
+	
+
+class PretrainModel(pl.LightningModule):
+    def __init__(self, args, crm):
+        super().__init__()
+        self.args = args
+        self.crm = crm
+        self.temperature = args.contrastive_temperature
+        self.criterion = NT_Xent(
+            args.contrastive_temperature, world_size=1
+        )
+
+    def forward(self, x):
+        return self.crm(x)
+
+    def training_step(self, batch, batch_idx):
+        x1, x2, _ = batch
+        h1, z1 = self.crm(x1)
+        h2, z2 = self.crm(x2)
+        loss = self.criterion(z1, z2)
+        self.log('pretrain/loss', loss)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.args.pretrain_lr)
+        return optimizer
+	
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Loss as in Khosla et al., 2020."""
+    def __init__(self, temperature: float = 0.07, base_temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
+        self.base_temperature = base_temperature
+
+    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        features: [batch_size, n_views, proj_dim]
+        labels:   [batch_size]
+        """
+        device = features.device
+        batch_size, n_views, dim = features.shape
+        features = features.view(batch_size * n_views, dim)
+        labels = labels.repeat_interleave(n_views)
+
+        # normalize
+        features = F.normalize(features, p=2, dim=1)
+
+        # cosine similarity matrix
+        sim_matrix = torch.div(
+            torch.matmul(features, features.T),
+            self.temperature
+        )
+        # mask out self-contrast cases
+        mask = torch.eye(batch_size * n_views, dtype=torch.bool, device=device)
+        sim_matrix.masked_fill_(mask, -1e9)
+
+        # create positive mask: same label & not self
+        label_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
+        positives = label_matrix & ~mask
+
+        # log‐softmax
+        log_prob = F.log_softmax(sim_matrix, dim=1)
+
+        # numerator: sum over positive pairs
+        mean_log_prob_pos = (positives.float() * log_prob).sum(1) / positives.sum(1).clamp(min=1)
+
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        return loss.mean()
+
+
+class SupConFineTuner(pl.LightningModule):
+    def __init__(self, args, crm: CRM):
+        super().__init__()
+        self.args = args
+        self.crm = crm
+        self.criterion = SupConLoss(temperature=args.supcon_temperature)
+
+    def training_step(self, batch, batch_idx):
+        x1, x2, y = batch
+        _, z1 = self.crm(x1)
+        _, z2 = self.crm(x2)
+        features = torch.stack([z1, z2], dim=1)
+        loss = self.criterion(features, y)
+        self.log('supcon/loss', loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.args.supcon_lr)

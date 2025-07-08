@@ -165,6 +165,42 @@ def compute_stratified_splits(X, y, cv_folds, seed_kfold, split_id):
 			return X[train_ids], X[test_ids], y[train_ids], y[test_ids]
 
 
+class PretrainDataset(CustomPytorchDataset):
+    def __init__(self, X, y, feature_std, p_mask=0.1, sigma_noise=0.1, p_synthetic=0.5, beta=0.1):
+        super().__init__(X, y)
+        self.feature_std = feature_std
+        self.p_mask = p_mask
+        self.sigma_noise = sigma_noise
+        self.p_synthetic = p_synthetic
+        self.beta = beta
+		
+    def single_augment(self, x, y):
+        D = x.shape[0]  # e.g., 3312
+        mask = torch.rand(D) > self.p_mask
+        x_masked = x * mask.float()
+        noise = torch.randn(D) * (self.sigma_noise * self.feature_std)
+        x_noisy = x_masked + noise
+        if torch.rand(1).item() < self.p_synthetic:  # Use .item() for scalar comparison
+            same_class_indices = (self.y == y).nonzero(as_tuple=True)[0]
+            if len(same_class_indices) > 1:
+                rand_index = torch.randint(0, len(same_class_indices), (1,)).item()  # Get scalar index
+                neighbor_idx = same_class_indices[rand_index]  # Scalar index
+                alpha = torch.rand(1).item() * self.beta  # Scalar value
+                x_synthetic = x + alpha * (self.X[neighbor_idx] - x)  # All tensors are (D,)
+            else:
+                x_synthetic = x_noisy  # Shape (D,)
+        else:
+            x_synthetic = x_noisy  # Shape (D,)
+        return x_synthetic
+
+    def __getitem__(self, index):
+        x = self.X[index]
+        y = self.y[index]
+        x1 = self.single_augment(x, y)
+        x2 = self.single_augment(x, y)
+        return x1, x2, y
+
+
 ###############    EMBEDDINGS     ###############
 
 def compute_histogram_embedding(args, X, embedding_size):
@@ -212,7 +248,7 @@ def compute_nmf_embeddings(Xt, rank):
 	print("Approximating V = H W.T")
 	print(f"Input V has shape {Xt.shape}")
 	assert type(Xt)==torch.Tensor
-	assert Xt.shape[0] > Xt.shape[1]
+	# assert Xt.shape[0] > Xt.shape[1]
 
 	nmf = NMF(Xt.shape, rank=rank).cuda()
 	nmf.fit(Xt.cuda(), beta=2, max_iter=1000, verbose=True) # beta=2 coresponds to the Frobenius norm, which is equivalent to an additive Gaussian noise model
@@ -262,7 +298,12 @@ class DatasetModule(pl.LightningDataModule):
 		self.y_valid = y_valid
 		self.X_test = X_test
 		self.y_test = y_test
-
+		
+		self.h_train = None
+		self.h_valid = None
+		self.h_test = None
+		self.use_h = False
+	
 		self.train_dataset = CustomPytorchDataset(X_train, y_train)
 		self.valid_dataset = CustomPytorchDataset(X_valid, y_valid)
 		self.test_dataset = CustomPytorchDataset(X_test, y_test)
@@ -284,6 +325,19 @@ class DatasetModule(pl.LightningDataModule):
 		return DataLoader(self.test_dataset, batch_size=self.args.batch_size,
 							num_workers=self.args.num_workers, pin_memory=self.args.pin_memory)
 
+	def set_latent_representations(self, h_train, h_valid, h_test):
+		"""Update the module to use latent representations."""
+		self.h_train = h_train
+		self.h_valid = h_valid
+		self.h_test = h_test
+		self.use_h = True
+		# Update datasets
+		self.train_dataset = CustomPytorchDataset(h_train, self.y_train)
+		self.valid_dataset = CustomPytorchDataset(h_valid, self.y_valid)
+		self.test_dataset = CustomPytorchDataset(h_test, self.y_test)
+		# Update feature dimension
+		self.args.num_features = h_train.shape[1]
+	
 	def get_embedding_matrix(self, embedding_type, embedding_size):
 		"""
 		Return matrix D x M
@@ -298,11 +352,11 @@ class DatasetModule(pl.LightningDataModule):
 
 		# Preprocess the data for the embeddings
 		if self.args.embedding_preprocessing == 'raw':
-			X_for_embeddings = self.X_train_raw
+			X_for_embeddings = self.h_train if self.use_h else self.X_train_raw
 		elif self.args.embedding_preprocessing == 'z_score':
-			X_for_embeddings = StandardScaler().fit_transform(self.X_train_raw)
+			X_for_embeddings = StandardScaler().fit_transform(self.h_train if self.use_h else self.X_train_raw)
 		elif self.args.embedding_preprocessing == 'minmax':
-			X_for_embeddings = MinMaxScaler().fit_transform(self.X_train_raw)
+			X_for_embeddings = MinMaxScaler().fit_transform(self.h_train if self.use_h else self.X_train_raw)
 		else:
 			raise Exception("embedding_preprocessing not supported")
 
@@ -403,7 +457,7 @@ def create_datamodule_with_cross_validation(args, X, y):
 	
 	# args.test_split defines the fold to pick
 	X_train_and_valid, X_test, y_train_and_valid, y_test = compute_stratified_splits(
-		X, y, cv_folds=args.cv_folds, seed_kfold=args.seed_kfold, split_id=args.test_split)
+		X, y, cv_folds=args.cv_folds, seed_kfold=args.repeat_id, split_id=args.test_split)
 
 	# randomly pick a validation set from the training_and_val data
 	X_train, X_valid, y_train, y_valid = train_test_split(
@@ -426,3 +480,44 @@ def create_datamodule_with_cross_validation(args, X, y):
 		return DatasetModule(args, X_train_and_valid, y_train_and_valid, X_test, y_test, X_test, y_test)
 	else:
 		return DatasetModule(args, X_train, y_train, X_valid, y_valid, X_test, y_test)
+	
+def get_full_dataset(args):
+	dataset = args.dataset
+
+	if dataset in ['metabric-pam50', 'metabric-dr', 'tcga-2ysurvival', 'tcga-tumor-grade']:
+		dataset_size = 200
+		if dataset=='metabric-pam50':
+			dataset_path = os.path.join(DATA_DIR, f'Metabric_samples/metabric_pam50_train_{dataset_size}.csv')
+		elif dataset=='metabric-dr':
+			dataset_path = os.path.join(DATA_DIR, f'Metabric_samples/metabric_DR_train_{dataset_size}.csv')
+		elif dataset=='tcga-2ysurvival':
+			dataset_path = os.path.join(DATA_DIR, f'TCGA_samples/tcga_2ysurvival_train_{dataset_size}.csv')
+		elif dataset=='tcga-tumor-grade':
+			dataset_path = os.path.join(DATA_DIR, f'TCGA_samples/tcga_tumor_grade_train_{dataset_size}.csv')
+
+		X, y = load_csv_data(dataset_path)
+
+	else:
+		if dataset=='lung':
+			X, y = load_lung()
+		elif dataset=='toxicity':
+			X, y = load_toxicity()
+		elif dataset=='prostate':
+			X, y = load_prostate()
+		elif dataset=='cll':
+			X, y = load_cll()
+		elif dataset=='smk':
+			X, y = load_smk()
+		elif dataset=='your_custom_dataset':
+			X, y = load_your_custom_dataset()
+		else:
+			raise Exception("Dataset not supported")
+	
+	if type(X)==pd.DataFrame:
+		X = X.to_numpy()
+	if type(y)==pd.Series:
+		y = y.to_numpy()
+
+	X, _, _ = standardize_data(X, X, X, args.patient_preprocessing)
+
+	return X, y
